@@ -1,0 +1,10 @@
+{
+  "name": "Number Merge",
+  "short_name": "Merge",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#050609",
+  "theme_color": "#07090d",
+  "icons": []
+}

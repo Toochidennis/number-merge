@@ -1,0 +1,467 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { COLS, INITIAL_GEMS, INITIAL_HIGHEST, REWARD_VALUES, ROWS } from '../game/constants';
+import { cloneBoard, createDistinctInitialBoard, createEmptyBoard, createInitialBoard, generateNextTile, shootTile } from '../game/gameLogic';
+import { getCurrentGoal, getMilestoneInfo, getRetiredValuesForHighest } from '../game/milestones';
+import { generateWeightedTile, getActiveTilePool } from '../game/tileGeneration';
+import { calculateMergeXp, calculateMilestoneXp, getLevelProgress, getTotalXpForLevel } from '../game/leveling';
+import type { Board, BoosterType, MergeAnimationState, MergeEvent, MilestoneInfo, ModalType, Position, ShotResult, TileValue } from '../game/types';
+import { storage } from '../utils/storage';
+
+interface Snapshot {
+  board: Board;
+  score: number;
+  currentTile: TileValue;
+  nextTile: TileValue;
+  highestBlock: TileValue;
+  totalXp: number;
+}
+
+export interface GameEngine {
+  screen: 'home' | 'game';
+  board: Board;
+  currentTile: TileValue;
+  nextTile: TileValue;
+  selectedColumn: number;
+  score: number;
+  bestScore: number;
+  gems: number;
+  highestBlock: TileValue;
+  level: number;
+  totalXp: number;
+  xpIntoLevel: number;
+  xpToNextLevel: number;
+  levelProgress: number;
+  boosters: Record<BoosterType, number>;
+  modal: ModalType;
+  modalTile: TileValue | null;
+  milestoneInfo: MilestoneInfo | null;
+  retiredTiles: TileValue[];
+  tutorialStep: number;
+  hammerActive: boolean;
+  isShooting: boolean;
+  isPromotingNextTile: boolean;
+  isResolvingMerge: boolean;
+  shotTile: TileValue | null;
+  shotTargetRow: number;
+  shotDuration: number;
+  mergeEvents: MergeEvent[];
+  mergeAnimation: MergeAnimationState | null;
+  combo: number;
+  currentGoal: number;
+  startGame: () => void;
+  goHome: () => void;
+  restart: () => void;
+  shoot: (column?: number) => void;
+  selectColumn: (column: number) => void;
+  moveSelection: (delta: number) => void;
+  pause: () => void;
+  resume: () => void;
+  useBooster: (type: BoosterType) => void;
+  hitWithHammer: (position: Position) => void;
+  skipTutorial: () => void;
+  closeGoal: () => void;
+  claimUnlock: (double: boolean) => void;
+  closeMilestone: () => void;
+  resolveCreatedAgain: (upgrade: boolean) => void;
+}
+
+const initialBoosters: Record<BoosterType, number> = storage.get('boosters', {
+  hammer: 3,
+  swap: 5,
+  undo: 3,
+});
+
+const PROMOTION_DURATION = 500;
+const MERGE_CONNECT_DURATION = 240;
+const MERGE_POP_DURATION = 180;
+const MERGE_CHAIN_PAUSE = 70;
+
+export function useGameEngine(): GameEngine {
+  const [screen, setScreen] = useState<'home' | 'game'>('home');
+  const [board, setBoard] = useState<Board>(createEmptyBoard);
+  const [currentTile, setCurrentTile] = useState<TileValue>(2);
+  const [nextTile, setNextTile] = useState<TileValue>(4);
+  const [selectedColumn, setSelectedColumn] = useState(2);
+  const [score, setScore] = useState(0);
+  const [bestScore, setBestScore] = useState(() => storage.get('best-score', 0));
+  const [gems, setGems] = useState(() => storage.get('gems', INITIAL_GEMS));
+  const [highestBlock, setHighestBlock] = useState<TileValue>(() => storage.get('highest-block', INITIAL_HIGHEST));
+  const [totalXp, setTotalXp] = useState(() => {
+    const savedLevel = storage.get('level', 1);
+    return storage.get('total-xp', getTotalXpForLevel(savedLevel));
+  });
+  const [boosters, setBoosters] = useState(initialBoosters);
+  const [modal, setModal] = useState<ModalType>(null);
+  const [modalTile, setModalTile] = useState<TileValue | null>(null);
+  const [milestoneInfo, setMilestoneInfo] = useState<MilestoneInfo | null>(null);
+  const [tutorialStep, setTutorialStep] = useState(0);
+  const [hammerActive, setHammerActive] = useState(false);
+  const [isShooting, setIsShooting] = useState(false);
+  const [isPromotingNextTile, setIsPromotingNextTile] = useState(false);
+  const [isResolvingMerge, setIsResolvingMerge] = useState(false);
+  const [shotTileValue, setShotTileValue] = useState<TileValue | null>(null);
+  const [shotTargetRow, setShotTargetRow] = useState(0);
+  const [shotDuration, setShotDuration] = useState(300);
+  const [mergeEvents, setMergeEvents] = useState<MergeEvent[]>([]);
+  const [mergeAnimation, setMergeAnimation] = useState<MergeAnimationState | null>(null);
+  const [combo, setCombo] = useState(0);
+  const historyRef = useRef<Snapshot[]>([]);
+  const pendingPosition = useRef<Position | null>(null);
+  const pendingTutorialTimer = useRef<number | null>(null);
+  const promotionTimer = useRef<number | null>(null);
+  const mergeTimer = useRef<number | null>(null);
+
+  // Single source of truth: highestBlock. Both the current goal and the set of
+  // retired tiles are derived from it — so a retired number can never reappear
+  // and the two systems can never drift apart.
+  const currentGoal = getCurrentGoal(highestBlock);
+  const retiredTiles = getRetiredValuesForHighest(highestBlock);
+  const levelState = getLevelProgress(totalXp);
+  const level = levelState.level;
+
+  useEffect(() => storage.set('best-score', bestScore), [bestScore]);
+  useEffect(() => storage.set('gems', gems), [gems]);
+  useEffect(() => storage.set('highest-block', highestBlock), [highestBlock]);
+  useEffect(() => storage.set('level', level), [level]);
+  useEffect(() => storage.set('total-xp', totalXp), [totalXp]);
+  useEffect(() => storage.set('boosters', boosters), [boosters]);
+  useEffect(() => {
+    if (modal === 'created-again') setModal(null);
+  }, [modal]);
+
+  useEffect(() => () => {
+    if (pendingTutorialTimer.current) window.clearTimeout(pendingTutorialTimer.current);
+    if (promotionTimer.current) window.clearTimeout(promotionTimer.current);
+    if (mergeTimer.current) window.clearTimeout(mergeTimer.current);
+  }, []);
+
+  // Current and next always share the same highest-block-driven weighted pool.
+  const spawnTile = useCallback((highest: number, exclude: TileValue[] = []): TileValue => {
+    return generateWeightedTile(highest, Math.random, exclude);
+  }, []);
+
+  const setupNormalGame = useCallback((previousBoard?: Board, previousShooter?: TileValue) => {
+    if (promotionTimer.current) window.clearTimeout(promotionTimer.current);
+    if (pendingTutorialTimer.current) window.clearTimeout(pendingTutorialTimer.current);
+    if (mergeTimer.current) window.clearTimeout(mergeTimer.current);
+    const retired = getRetiredValuesForHighest(highestBlock);
+    setBoard(previousBoard ? createDistinctInitialBoard(previousBoard, retired) : createInitialBoard(retired));
+    setScore(0);
+    const firstTile = spawnTile(highestBlock, previousShooter ? [previousShooter] : []);
+    const followingTile = spawnTile(highestBlock, [firstTile]);
+    setCurrentTile(firstTile);
+    setNextTile(followingTile);
+    setSelectedColumn(2);
+    setTutorialStep(0);
+    setModal(null);
+    setHammerActive(false);
+    setIsShooting(false);
+    setIsPromotingNextTile(false);
+    setIsResolvingMerge(false);
+    setMergeAnimation(null);
+    historyRef.current = [];
+  }, [highestBlock, spawnTile]);
+
+  const startGame = useCallback(() => {
+    setScreen('game');
+    if (!storage.get('tutorial-complete', false) && !retiredTiles.includes(2)) {
+      setBoard(createEmptyBoard());
+      setScore(0);
+      setCurrentTile(2);
+      setNextTile(2);
+      setSelectedColumn(2);
+      setTutorialStep(1);
+      setModal(null);
+      historyRef.current = [];
+    } else {
+      setupNormalGame(board, currentTile);
+    }
+  }, [board, currentTile, retiredTiles, setupNormalGame]);
+
+  const goHome = useCallback(() => {
+    if (promotionTimer.current) window.clearTimeout(promotionTimer.current);
+    if (pendingTutorialTimer.current) window.clearTimeout(pendingTutorialTimer.current);
+    if (mergeTimer.current) window.clearTimeout(mergeTimer.current);
+    setModal(null);
+    setScreen('home');
+    setTutorialStep(0);
+    setIsShooting(false);
+    setIsPromotingNextTile(false);
+    setIsResolvingMerge(false);
+    setMergeAnimation(null);
+  }, []);
+
+  const restart = useCallback(() => {
+    setScreen('game');
+    setupNormalGame(board, currentTile);
+  }, [board, currentTile, setupNormalGame]);
+
+  const finishTutorial = useCallback(() => {
+    storage.set('tutorial-complete', true);
+    setTutorialStep(5);
+    setModal('first-goal');
+  }, []);
+
+  const skipTutorial = useCallback(() => {
+    storage.set('tutorial-complete', true);
+    setupNormalGame(board, currentTile);
+  }, [board, currentTile, setupNormalGame]);
+
+  const closeGoal = useCallback(() => {
+    setupNormalGame(board, currentTile);
+  }, [board, currentTile, setupNormalGame]);
+
+  const shoot = useCallback((requestedColumn?: number) => {
+    if (screen !== 'game' || modal || isShooting || isPromotingNextTile || isResolvingMerge || hammerActive) return;
+    if (tutorialStep === 2 || tutorialStep === 4 || tutorialStep === 5) return;
+    const column = tutorialStep > 0 ? 2 : Math.max(0, Math.min(COLS - 1, requestedColumn ?? selectedColumn));
+    const tile = currentTile;
+    const before: Snapshot = { board: cloneBoard(board), score, currentTile, nextTile, highestBlock, totalXp };
+    let columnHeight = 0;
+    while (columnHeight < ROWS && board[columnHeight][column] !== null) columnHeight += 1;
+    const matchingHit = columnHeight > 0 && board[columnHeight - 1][column] === tile;
+    const targetRow = matchingHit ? columnHeight - 1 : Math.min(columnHeight, ROWS - 1);
+    const flightDuration = 190 + (ROWS - 1 - targetRow) * 23;
+    const result = shootTile(board, column, tile);
+    setSelectedColumn(column);
+    setIsShooting(true);
+    setShotTileValue(tile);
+    setShotTargetRow(targetRow);
+    setShotDuration(flightDuration);
+    setMergeEvents([]);
+    setMergeAnimation(null);
+
+    const promoteAndFinish = (shotResult: ShotResult, nextScore: number) => {
+      setBoard(shotResult.board);
+      setIsResolvingMerge(false);
+      setMergeAnimation(null);
+      setIsShooting(false);
+      setShotTileValue(null);
+      window.setTimeout(() => {
+        setMergeEvents([]);
+        setCombo(0);
+      }, 850);
+
+      if (tutorialStep === 1) {
+        setCurrentTile(nextTile);
+        setIsPromotingNextTile(true);
+        promotionTimer.current = window.setTimeout(() => {
+          setNextTile(2);
+          setIsPromotingNextTile(false);
+          setTutorialStep(2);
+          pendingTutorialTimer.current = window.setTimeout(() => setTutorialStep(3), 1250);
+        }, PROMOTION_DURATION);
+        return;
+      }
+      if (tutorialStep === 3) {
+        setCurrentTile(nextTile);
+        setIsPromotingNextTile(true);
+        promotionTimer.current = window.setTimeout(() => {
+          setNextTile(2);
+          setIsPromotingNextTile(false);
+          setTutorialStep(4);
+          pendingTutorialTimer.current = window.setTimeout(finishTutorial, 1250);
+        }, PROMOTION_DURATION);
+        return;
+      }
+
+      const created = shotResult.merges.at(-1)?.value;
+      const isNewRecord = created !== undefined && created > highestBlock;
+
+      // The next queue immediately adopts the pool unlocked by this shot.
+      const nextHighest = isNewRecord ? (created as TileValue) : highestBlock;
+      // Honor the queue: the tile shown in NEXT becomes the new origin tile.
+      // Only re-roll if this shot's milestone just retired that exact value.
+      const nextActivePool = getActiveTilePool(nextHighest);
+      const promotedTile = !nextActivePool.includes(nextTile)
+        ? spawnTile(nextHighest, [])
+        : nextTile;
+      const generatedNextTile = spawnTile(nextHighest, [promotedTile]);
+
+      setCurrentTile(promotedTile);
+      setIsPromotingNextTile(true);
+
+      promotionTimer.current = window.setTimeout(() => {
+        setNextTile(generatedNextTile);
+        setIsPromotingNextTile(false);
+
+        if (isNewRecord) {
+          setHighestBlock(nextHighest);
+          setModalTile(nextHighest);
+          // A milestone is "reached" the first time we cross it — i.e. its
+          // retired tile is newly retired (not already gone before this shot).
+          const createdMilestone = getMilestoneInfo(nextHighest);
+          const reachedMilestone = createdMilestone && !retiredTiles.includes(createdMilestone.retired)
+            ? createdMilestone
+            : null;
+          if (reachedMilestone) {
+            setMilestoneInfo(reachedMilestone);
+            setModal('milestone');
+          } else {
+            setModal('unlock');
+          }
+          pendingPosition.current = shotResult.landing;
+        }
+      }, PROMOTION_DURATION);
+    };
+
+    const playMergeStep = (shotResult: ShotResult, index: number, nextScore: number) => {
+      const step = shotResult.mergeSteps[index];
+      if (!step) {
+        promoteAndFinish(shotResult, nextScore);
+        return;
+      }
+
+      setBoard(step.boardBefore);
+      setMergeAnimation({ step, phase: 'connecting' });
+      mergeTimer.current = window.setTimeout(() => {
+        setIsShooting(false);
+        setShotTileValue(null);
+        setBoard(step.boardAfter);
+        setMergeEvents([{ ...step.result, value: step.value }]);
+        setMergeAnimation({ step, phase: 'popping' });
+        mergeTimer.current = window.setTimeout(() => {
+          setMergeAnimation(null);
+          mergeTimer.current = window.setTimeout(
+            () => playMergeStep(shotResult, index + 1, nextScore),
+            MERGE_CHAIN_PAUSE,
+          );
+        }, MERGE_POP_DURATION);
+      }, MERGE_CONNECT_DURATION);
+    };
+
+    window.setTimeout(() => {
+      if (result.gameOver) {
+        setIsShooting(false);
+        setShotTileValue(null);
+        setModal('game-over');
+        return;
+      }
+
+      historyRef.current = [...historyRef.current.slice(-9), before];
+      const nextScore = score + result.scoreGained;
+      const created = result.merges.at(-1)?.value;
+      const earnedXp = calculateMergeXp(result.merges)
+        + (created && created > highestBlock ? calculateMilestoneXp(highestBlock, created) : 0);
+      setScore(nextScore);
+      setTotalXp((xp) => xp + earnedXp);
+      setBestScore((oldBest) => Math.max(oldBest, nextScore));
+      setCombo(result.merges.length);
+      if (result.mergeSteps.length) {
+        setIsResolvingMerge(true);
+        playMergeStep(result, 0, nextScore);
+      } else {
+        setIsShooting(false);
+        setShotTileValue(null);
+        promoteAndFinish(result, nextScore);
+      }
+    }, flightDuration);
+  }, [board, currentTile, finishTutorial, hammerActive, highestBlock, isPromotingNextTile, isResolvingMerge, isShooting, modal, nextTile, retiredTiles, score, screen, selectedColumn, spawnTile, totalXp, tutorialStep]);
+
+  const selectColumn = useCallback((column: number) => setSelectedColumn(Math.max(0, Math.min(COLS - 1, column))), []);
+  const moveSelection = useCallback((delta: number) => {
+    setSelectedColumn((column) => Math.max(0, Math.min(COLS - 1, column + delta)));
+  }, []);
+
+  const pause = useCallback(() => {
+    if (!isShooting && !isPromotingNextTile && !isResolvingMerge && !modal) setModal('pause');
+  }, [isPromotingNextTile, isResolvingMerge, isShooting, modal]);
+  const resume = useCallback(() => setModal(null), []);
+
+  const useBooster = useCallback((type: BoosterType) => {
+    if (modal || isShooting || isPromotingNextTile || isResolvingMerge || tutorialStep > 0 || boosters[type] <= 0) return;
+    if (type === 'hammer') {
+      setHammerActive((active) => !active);
+      return;
+    }
+    if (type === 'swap') {
+      setBoosters((counts) => ({ ...counts, swap: counts.swap - 1 }));
+      setCurrentTile(nextTile);
+      setNextTile(spawnTile(highestBlock, [nextTile]));
+      return;
+    }
+    const previous = historyRef.current.at(-1);
+    if (!previous) return;
+    historyRef.current = historyRef.current.slice(0, -1);
+    const activePoolForUndo = getActiveTilePool(highestBlock);
+    setBoosters((counts) => ({ ...counts, undo: counts.undo - 1 }));
+    setBoard(previous.board);
+    setScore(previous.score);
+    setTotalXp(previous.totalXp);
+    // Restore the exact tiles the player had, unless they are now retired.
+    const restoredCurrent = !activePoolForUndo.includes(previous.currentTile)
+      ? spawnTile(highestBlock, [])
+      : previous.currentTile;
+    const restoredNext = !activePoolForUndo.includes(previous.nextTile) || previous.nextTile === restoredCurrent
+      ? spawnTile(highestBlock, [restoredCurrent])
+      : previous.nextTile;
+    setCurrentTile(restoredCurrent);
+    setNextTile(restoredNext);
+  }, [boosters, highestBlock, isPromotingNextTile, isResolvingMerge, isShooting, modal, nextTile, spawnTile, tutorialStep]);
+
+  const hitWithHammer = useCallback(({ row, col }: Position) => {
+    if (!hammerActive || board[row][col] === null) return;
+    const next = cloneBoard(board);
+    next[row][col] = null;
+    for (let column = 0; column < COLS; column += 1) {
+      const values = next.map((line) => line[column]).filter((value): value is TileValue => value !== null);
+      for (let r = 0; r < ROWS; r += 1) next[r][column] = values[r] ?? null;
+    }
+    historyRef.current = [...historyRef.current.slice(-9), { board: cloneBoard(board), score, currentTile, nextTile, highestBlock, totalXp }];
+    setBoard(next);
+    setBoosters((counts) => ({ ...counts, hammer: counts.hammer - 1 }));
+    setHammerActive(false);
+  }, [board, currentTile, hammerActive, highestBlock, nextTile, score, totalXp]);
+
+  const claimUnlock = useCallback((double: boolean) => {
+    if (modalTile) setGems((amount) => amount + (REWARD_VALUES[modalTile] ?? 10) * (double ? 2 : 1));
+    setModal(null);
+  }, [modalTile]);
+
+  const closeMilestone = useCallback(() => {
+    if (modalTile) setGems((amount) => amount + (REWARD_VALUES[modalTile] ?? 10));
+    setMilestoneInfo(null);
+    setModal(null);
+  }, [modalTile]);
+
+  const resolveCreatedAgain = useCallback((upgrade: boolean) => {
+    let upgradedMilestone: MilestoneInfo | null = null;
+    if (upgrade && gems >= 155 && modalTile && pendingPosition.current) {
+      setGems((amount) => amount - 155);
+      const upgraded = modalTile * 2;
+      upgradedMilestone = getMilestoneInfo(upgraded);
+      setBoard((current) => {
+        const next = cloneBoard(current);
+        const { row, col } = pendingPosition.current!;
+        if (next[row]?.[col] === modalTile) {
+          next[row][col] = upgraded;
+          setHighestBlock((highest) => (upgraded > highest ? upgraded : highest));
+        }
+        return next;
+      });
+      if (upgradedMilestone && !retiredTiles.includes(upgradedMilestone.retired)) {
+        // Retirement auto-updates via highestBlock; just refresh the shooter
+        // tiles so neither is a value retired by crossing this milestone.
+        const safeCurrent = spawnTile(upgraded, []);
+        const safeNext = spawnTile(upgraded, [safeCurrent]);
+        setCurrentTile(safeCurrent);
+        setNextTile(safeNext);
+        setMilestoneInfo(upgradedMilestone);
+        setModalTile(upgradedMilestone.current);
+        setModal('milestone');
+        return;
+      }
+    }
+    setModal(null);
+  }, [gems, modalTile, retiredTiles, spawnTile]);
+
+  return {
+    screen, board, currentTile, nextTile, selectedColumn, score, bestScore, gems, highestBlock, level,
+    totalXp, xpIntoLevel: levelState.xpIntoLevel, xpToNextLevel: levelState.xpToNextLevel, levelProgress: levelState.progressPercent,
+    boosters, modal, modalTile, milestoneInfo, retiredTiles, tutorialStep, hammerActive, isShooting,
+    isPromotingNextTile, isResolvingMerge, shotTile: shotTileValue,
+    shotTargetRow, shotDuration, mergeEvents, mergeAnimation, combo, currentGoal,
+    startGame, goHome, restart, shoot, selectColumn, moveSelection, pause,
+    resume, useBooster, hitWithHammer, skipTutorial, closeGoal, claimUnlock, closeMilestone, resolveCreatedAgain,
+  };
+}
