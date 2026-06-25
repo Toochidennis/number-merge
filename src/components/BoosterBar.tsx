@@ -1,10 +1,10 @@
 import type { BoosterType } from '../game/types';
 import { useTranslation } from '../i18n';
 
-const boosters: Array<{ type: BoosterType; icon: string; label: string }> = [
-  { type: 'hammer', icon: '🔨', label: 'smash' },
-  { type: 'swap', icon: '⟳', label: 'swap' },
-  { type: 'undo', icon: '↶', label: 'undo' },
+const boosters: Array<{ type: BoosterType; icon: string; label: string; ariaLabel: string }> = [
+  { type: 'hammer', icon: '🔨', label: 'smash', ariaLabel: 'Use hammer booster' },
+  { type: 'swap',   icon: '⟳', label: 'swap',  ariaLabel: 'Use swap booster' },
+  { type: 'undo',   icon: '↶', label: 'undo',  ariaLabel: 'Use undo booster' },
 ];
 
 export function BoosterBar({ counts, active, onUse }: {
@@ -21,8 +21,9 @@ export function BoosterBar({ counts, active, onUse }: {
           className={active === booster.type ? 'active' : ''}
           disabled={counts[booster.type] <= 0}
           onClick={() => onUse(booster.type)}
+          aria-label={booster.ariaLabel}
         >
-          <span className={`booster-icon ${booster.type}`}>{booster.icon}</span>
+          <span className={`booster-icon ${booster.type}`} aria-hidden="true">{booster.icon}</span>
           <span className="booster-copy"><strong>{t(booster.label)}</strong><small>×{counts[booster.type]}</small></span>
         </button>
       ))}
