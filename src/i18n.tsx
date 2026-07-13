@@ -1,14 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import { useCatalogStore } from './state/catalogStore';
 
-export const SUPPORTED_LANGUAGES = [
-  ['ar', 'العربية', 'SA'], ['zh', '中文', 'CN'], ['nl', 'Nederlands', 'NL'], ['en', 'English', 'GB'],
-  ['fr', 'Français', 'FR'], ['de', 'Deutsch', 'DE'], ['ha', 'Hausa', 'NG'], ['hi', 'हिन्दी', 'IN'],
-  ['ig', 'Igbo', 'NG'], ['id', 'Bahasa Indonesia', 'ID'], ['it', 'Italiano', 'IT'], ['ja', '日本語', 'JP'],
-  ['ko', '한국어', 'KR'], ['ms', 'Bahasa Melayu', 'MY'], ['pt', 'Português', 'PT'], ['ru', 'Русский', 'RU'],
-  ['es', 'Español', 'ES'], ['sw', 'Kiswahili', 'KE'], ['th', 'ไทย', 'TH'], ['tr', 'Türkçe', 'TR'], ['ur', 'اردو', 'PK'],
-] as const;
-
-export type LanguageCode = typeof SUPPORTED_LANGUAGES[number][0];
+export type LanguageCode = string;
 type Dictionary = Record<string, string>;
 
 const en: Dictionary = {
@@ -59,18 +52,17 @@ const packs: Record<Exclude<LanguageCode, 'en'>, Dictionary> = {
 };
 
 const LANGUAGE_STORAGE_KEY = 'number-merge-language';
-const supported = new Set(SUPPORTED_LANGUAGES.map(([code]) => code));
 export const isRtlLanguage = (language: LanguageCode) => language === 'ar' || language === 'ur';
 
 function detectLanguage(): LanguageCode {
   try {
     const stored = localStorage.getItem(LANGUAGE_STORAGE_KEY)?.toLowerCase();
-    if (stored && supported.has(stored as LanguageCode)) return stored as LanguageCode;
+    if (stored && /^[a-z]{2}$/.test(stored)) return stored;
   } catch { /* use device language */ }
   const candidates = typeof navigator === 'undefined' ? [] : [...(navigator.languages ?? []), navigator.language];
   for (const candidate of candidates) {
     const base = candidate?.toLowerCase().split('-')[0] as LanguageCode;
-    if (supported.has(base)) return base;
+    if (base === 'en' || Object.prototype.hasOwnProperty.call(packs, base)) return base;
   }
   return 'en';
 }
@@ -78,6 +70,7 @@ function detectLanguage(): LanguageCode {
 type I18nValue = {
   language: LanguageCode;
   direction: 'rtl' | 'ltr';
+  locale: string;
   setLanguage: (language: LanguageCode) => void;
   t: (key: string, values?: Record<string, string | number>) => string;
   formatNumber: (value: number) => string;
@@ -87,23 +80,26 @@ const I18nContext = createContext<I18nValue | null>(null);
 
 export function LanguageProvider({ children }: { children: React.ReactNode }) {
   const [language, setLanguageState] = useState<LanguageCode>(detectLanguage);
-  const direction: 'rtl' | 'ltr' = isRtlLanguage(language) ? 'rtl' : 'ltr';
+  const apiLanguages = useCatalogStore((state) => state.languages);
+  const metadata = apiLanguages.find((item) => item.code === language);
+  const direction: 'rtl' | 'ltr' = metadata?.direction ?? (isRtlLanguage(language) ? 'rtl' : 'ltr');
+  const locale = metadata?.locale ?? language;
   const setLanguage = useCallback((next: LanguageCode) => {
     setLanguageState(next);
     try { localStorage.setItem(LANGUAGE_STORAGE_KEY, next); } catch { /* state still works */ }
   }, []);
   const t = useCallback((key: string, values: Record<string, string | number> = {}) => {
-    const template = (language === 'en' ? en[key] : packs[language][key]) ?? en[key] ?? key;
+    const template = (language === 'en' ? en[key] : packs[language]?.[key]) ?? en[key] ?? key;
     return Object.entries(values).reduce((text, [name, value]) => text.replaceAll(`{${name}}`, String(value)), template);
   }, [language]);
-  const formatNumber = useCallback((value: number) => new Intl.NumberFormat(language).format(value), [language]);
+  const formatNumber = useCallback((value: number) => new Intl.NumberFormat(locale).format(value), [locale]);
 
   useEffect(() => {
     document.documentElement.lang = language;
     document.documentElement.dir = direction;
   }, [direction, language]);
 
-  const value = useMemo(() => ({ language, direction, setLanguage, t, formatNumber }), [direction, formatNumber, language, setLanguage, t]);
+  const value = useMemo(() => ({ language, direction, locale, setLanguage, t, formatNumber }), [direction, formatNumber, language, locale, setLanguage, t]);
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
 }
 
