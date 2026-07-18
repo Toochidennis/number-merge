@@ -5,6 +5,7 @@ import { HomeScreen } from './components/HomeScreen';
 import { ProfileScreen } from './components/ProfileScreen';
 import { useGameEngine } from './hooks/useGameEngine';
 import { usePlayerProfile } from './hooks/usePlayerProfile';
+import { loadCatalogs } from './state/catalogStore';
 
 export default function App() {
   const game = useGameEngine();
@@ -14,6 +15,7 @@ export default function App() {
   const [toast, setToast] = useState('');
 
   useEffect(() => {
+    void loadCatalogs();
     const timer = window.setTimeout(() => setLoading(false), 900);
     const showToast = (event: Event) => {
       setToast((event as CustomEvent<string>).detail);
